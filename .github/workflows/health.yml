@@ -1,0 +1,82 @@
+name: Supabase health
+
+# Probes Seat Sherpa's database API every 5 minutes. Three states:
+#   ok        200 within 8 s
+#   slow      200, but both attempts took longer than 8 s (the 2026-09-17 outage
+#             announced itself this way about 20 minutes before the collapse)
+#   down      no 200 in two tries
+# slow and down FAIL the run (GitHub emails the account) and, on the first
+# failing run only, an edge function emails the founder. The first ok run after
+# a failure sends one recovery email.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: health
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe the REST API (two tries, 15 s each)
+        id: probe
+        env:
+          ANON: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          url='https://vmfmbntacifqoqxqxgsk.supabase.co/rest/v1/app_config?select=key&limit=1'
+          state=down
+          code=000
+          secs=0
+          for i in 1 2; do
+            out=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 -H "apikey: $ANON" -H "Authorization: Bearer $ANON" "$url" || echo '000 15')
+            code=${out%% *}
+            secs=${out##* }
+            echo "attempt $i: http $code in ${secs}s"
+            if [ "$code" = "200" ]; then
+              if awk "BEGIN{exit !($secs < 8)}"; then state=ok; break; else state=slow; fi
+            fi
+            sleep 20
+          done
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "secs=$secs" >> "$GITHUB_OUTPUT"
+
+      - name: Result of the previous run
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow health.yml --status completed --limit 1 --json conclusion --jq '.[0].conclusion // "success"')
+          echo "previous run: $prev"
+          echo "conclusion=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Email on state change
+        if: (steps.probe.outputs.state != 'ok' && steps.prev.outputs.conclusion != 'failure') || (steps.probe.outputs.state == 'ok' && steps.prev.outputs.conclusion == 'failure')
+        env:
+          BEARER: ${{ secrets.ALERT_BEARER }}
+          STATE: ${{ steps.probe.outputs.state }}
+          CODE: ${{ steps.probe.outputs.code }}
+          SECS: ${{ steps.probe.outputs.secs }}
+        run: |
+          if [ "$STATE" = "ok" ]; then state=recovered; else state=$STATE; fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -s --max-time 20 -X POST \
+            -H "Authorization: Bearer $BEARER" -H 'content-type: application/json' \
+            -d "{\"state\":\"$state\",\"http\":\"$CODE\",\"seconds\":\"$SECS\",\"run\":\"$run_url\"}" \
+            https://vmfmbntacifqoqxqxgsk.supabase.co/functions/v1/alert-outage
+          echo
+
+      - name: Fail the run while not ok
+        if: steps.probe.outputs.state != 'ok'
+        run: |
+          echo "REST probe ${{ steps.probe.outputs.state }} (http ${{ steps.probe.outputs.code }}, ${{ steps.probe.outputs.secs }}s)"
+          exit 1
