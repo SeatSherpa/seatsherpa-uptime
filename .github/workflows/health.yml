@@ -83,3 +83,5 @@ jobs:
         run: |
           echo "REST probe ${{ steps.probe.outputs.state }} (http ${{ steps.probe.outputs.code }}, ${{ steps.probe.outputs.secs }}s)"
           exit 1
+
+# Workflow file last committed by the repository account so the schedule has a valid actor.
